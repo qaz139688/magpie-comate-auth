@@ -5,3 +5,8 @@ package-lock.json
 *.log
 .DS_Store
 Thumbs.db
+.env
+.env.*
+comate-*.json
+.comate-context-debug.json
+*.pem

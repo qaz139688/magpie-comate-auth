@@ -20,6 +20,7 @@ import { createServer } from "node:http"
 import { dirname, join, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
+import { deviceLogin } from "./device-auth.mjs"
 
 const PROVIDER_ID = "comate"
 const PROVIDER_NAME = "文心快码 Comate"
@@ -79,7 +80,7 @@ function pathOf(u) {
 }
 
 // 读 magpie 里任意 provider 的 cookies（只读）。用于「复用已登录的百度账号」。
-function readMagpieCookies(providerIds = ["dumate", "comate"]) {
+function readMagpieAuth(providerIds = ["comate", "dumate"]) {
   for (const file of magpieAuthFiles()) {
     if (!existsSync(file)) continue
     let data
@@ -90,6 +91,7 @@ function readMagpieCookies(providerIds = ["dumate", "comate"]) {
     }
     for (const id of providerIds) {
       const entry = data?.[id]
+      if (entry?.source === "device" && entry.license) return entry
       const cookies = Array.isArray(entry?.cookies) ? entry.cookies : null
       if (!cookies?.length) continue
       if (!cookies.some((c) => c?.name === "BDUSS")) continue
@@ -142,14 +144,15 @@ function signInError(message) {
   return err
 }
 
-async function getJsonOnce(path, cookieHeader, timeoutMs) {
+async function getJsonOnce(path, cookieHeader, timeoutMs, extraHeaders = {}) {
   const res = await fetch(BASE + path, {
     method: "GET",
     headers: {
-      Cookie: cookieHeader,
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
       "User-Agent": UA,
       Accept: "application/json",
       Referer: USER_CENTER,
+      ...extraHeaders,
     },
     signal: AbortSignal.timeout(timeoutMs),
     redirect: "follow",
@@ -165,19 +168,19 @@ async function getJsonOnce(path, cookieHeader, timeoutMs) {
   }
   const status = String(json?.status ?? "").toUpperCase()
   if (status === "UNAUTHORIZED" || status === "NOT_LOGIN" || status === "FORBIDDEN") {
-    // Comate 在短时间内被连打几次就会回「没有授权!」，并不是登录真的失效：
-    // 所以这里不带 signIn，免得 magpie 把账号标成过期；过几分钟自然恢复。
-    const err = new Error(`Comate 暂时拒绝请求（${cardText(json?.message) || status}），稍后再刷新`)
-    err.code = "FLAKY_UNAUTHORIZED"
+    // 该响应既可能来自无效凭据，也可能来自临时限制，不能直接认定为限流。
+    // 不自动标记账号过期；提示用户确认官网登录并提交 Comate 自己的 Cookie。
+    const err = new Error(`Comate 拒绝当前登录凭据（${cardText(json?.message) || status}）。请重新使用官网设备授权登录；若官网也无法访问，请稍后再试`)
+    err.code = "COMATE_AUTHORIZATION_REJECTED"
     throw err
   }
   if (status && status !== "OK") throw new Error(`Comate 接口错误（${path}）：${cardText(json?.message) || status}`)
   return json?.data
 }
 
-// 不重试：Comate 的「没有授权!」就是请求打太快了，再补一次只会更糟。
-async function getJson(path, cookieHeader, { timeoutMs = 15000 } = {}) {
-  return getJsonOnce(path, cookieHeader, timeoutMs)
+// 不自动重试：拒绝授权的原因不确定，连续请求可能加重临时限制。
+async function getJson(path, cookieHeader, { timeoutMs = 15000, headers = {} } = {}) {
+  return getJsonOnce(path, cookieHeader, timeoutMs, headers)
 }
 
 // 卡片刷新很频繁，Comate 又不喜欢同一登录态连发：同一份 cookies 的用量 10 分钟内复用。
@@ -185,6 +188,8 @@ async function getJson(path, cookieHeader, { timeoutMs = 15000 } = {}) {
 const usageCache = new Map()
 const CACHE_TTL_MS = 600_000
 const CACHE_FILE = "comate-usage-cache.json"
+const MODEL_CONTEXT_CACHE_FILE = "comate-model-contexts.json"
+const MODEL_CONTEXT_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 
 function dataDir() {
   for (const f of magpieAuthFiles()) {
@@ -267,33 +272,119 @@ const PROXY_PORT = Number(process.env.COMATE_PROXY_PORT ?? 3427)
 // modelId 是 Comate 服务端认的完整 key（<type>_<hash>），从 `zulu list-model` 取一次，
 // 会随服务端版本变；对不上时用 modelType 前缀兜底，再不行就报错让用户重跑 list-model。
 const MODELS = [
-  { id: "deepseek-v4-flash", modelId: "deepseek-v4-flash_a8668ea86c3d40e7ad1f8ee45715d447", label: "Deepseek V4 Flash", vision: false },
-  { id: "deepseek-v4-pro", modelId: "deepseek-v4-pro_4ba5277b630243be9eeb19fe48f853fa", label: "Deepseek V4 Pro", vision: false },
-  { id: "deepseek-v4.1-flash", modelId: "deepseek-v4.1-flash_4827e158760447029e6594bb2b1ab066", label: "Deepseek V4.1 Flash", vision: true, effort: ["low", "high", "max"] },
-  { id: "ernie-5.5-flash-preview", modelId: "ernie-5.5-flash-preview_996d9d76bb7c45ecbff286216aaeeab2", label: "ERNIE 5.5 Flash Preview", vision: true },
-  { id: "glm-4.7-fc", modelId: "glm-4.7-fc_0b87452a03394418b5c8d5468deff6c7", label: "GLM-4.7", vision: false },
-  { id: "glm-5-turbo-fc", modelId: "glm-5-turbo-fc_6748c832242b4bcb8f715c7c7902d1ad", label: "GLM-5-Turbo", vision: false },
-  { id: "glm-5.1", modelId: "glm-5.1_a231cc317baf4eaaa0b5afdd4de5f1d9", label: "GLM-5.1", vision: false },
-  { id: "glm-5.2", modelId: "glm-5.2_50c584482e9d47edbbe47938a88b56b1", label: "GLM-5.2", vision: false },
-  { id: "glm-5.3", modelId: "glm-5.3_37c550fc6d5b4fb2825abc2c1c88a6b3", label: "GLM-5.3", vision: false, effort: ["low", "high", "max"] },
-  { id: "glm-5.3-flash", modelId: "glm-5.3-flash_805131a9381a4940ba0f2d90cad0e7eb", label: "GLM-5.3-Flash", vision: true },
-  { id: "glm-5v-turbo", modelId: "glm-5v-turbo_ea9e4f222f0a40b281953ebcb6981dda", label: "GLM-5v-Turbo", vision: true },
-  { id: "kimi-k2.6-oneapi", modelId: "kimi-k2.6-oneapi_123e4567e89b12d3a456426614174000", label: "Kimi-K2.6", vision: true },
-  { id: "minimax-m2.5-fc", modelId: "minimax-m2.5-fc_c99ea14f526548a8bc28717d4e854123", label: "MiniMax M2.5", vision: false },
-  { id: "minimax-m3", modelId: "minimax-m3_a8f465fbedb942efadace88370ad7ff1", label: "MiniMax M3", vision: true },
-  { id: "minimax-m2.7-fc", modelId: "minimax-m2.7-fc_047f123f661c414bb253c05b605c391e", label: "MiniMax-M2.7", vision: false },
+  { id: "deepseek-v4-flash", modelId: "deepseek-v4-flash_a8668ea86c3d40e7ad1f8ee45715d447", label: "Deepseek V4 Flash", vision: false, context: 1_024_000 },
+  { id: "deepseek-v4-pro", modelId: "deepseek-v4-pro_4ba5277b630243be9eeb19fe48f853fa", label: "Deepseek V4 Pro", vision: false, context: 1_024_000 },
+  { id: "deepseek-v4.1-flash", modelId: "deepseek-v4.1-flash_4827e158760447029e6594bb2b1ab066", label: "Deepseek V4.1 Flash", vision: true, effort: ["low", "high", "max"], context: 1_000_000 },
+  { id: "ernie-5.5-flash-preview", modelId: "ernie-5.5-flash-preview_996d9d76bb7c45ecbff286216aaeeab2", label: "ERNIE 5.5 Flash Preview", vision: true, context: 1_000_000 },
+  { id: "glm-4.7-fc", modelId: "glm-4.7-fc_0b87452a03394418b5c8d5468deff6c7", label: "GLM-4.7", vision: false, context: 200_000 },
+  { id: "glm-5-turbo-fc", modelId: "glm-5-turbo-fc_6748c832242b4bcb8f715c7c7902d1ad", label: "GLM-5-Turbo", vision: false, context: 200_000 },
+  { id: "glm-5.1", modelId: "glm-5.1_a231cc317baf4eaaa0b5afdd4de5f1d9", label: "GLM-5.1", vision: false, context: 256_000 },
+  { id: "glm-5.2", modelId: "glm-5.2_50c584482e9d47edbbe47938a88b56b1", label: "GLM-5.2", vision: false, context: 1_000_000 },
+  { id: "glm-5.3", modelId: "glm-5.3_37c550fc6d5b4fb2825abc2c1c88a6b3", label: "GLM-5.3", vision: false, effort: ["low", "high", "max"], context: 1_000_000 },
+  { id: "glm-5.3-flash", modelId: "glm-5.3-flash_805131a9381a4940ba0f2d90cad0e7eb", label: "GLM-5.3-Flash", vision: true, context: 1_000_000 },
+  { id: "glm-5v-turbo", modelId: "glm-5v-turbo_ea9e4f222f0a40b281953ebcb6981dda", label: "GLM-5v-Turbo", vision: true, context: 200_000 },
+  { id: "kimi-k2.6-oneapi", modelId: "kimi-k2.6-oneapi_123e4567e89b12d3a456426614174000", label: "Kimi-K2.6", vision: true, context: 256_000 },
+  { id: "minimax-m2.5-fc", modelId: "minimax-m2.5-fc_c99ea14f526548a8bc28717d4e854123", label: "MiniMax M2.5", vision: false, context: 200_000 },
+  { id: "minimax-m3", modelId: "minimax-m3_a8f465fbedb942efadace88370ad7ff1", label: "MiniMax M3", vision: true, context: 512_000 },
+  { id: "minimax-m2.7-fc", modelId: "minimax-m2.7-fc_047f123f661c414bb253c05b605c391e", label: "MiniMax-M2.7", vision: false, context: 200_000 },
 ]
 
 const modelOf = (name) => MODELS.find((m) => m.id === name || m.label === name) ?? MODELS[0]
 
-function modelEntry(m, baseURL) {
+let modelContextCache = null
+let modelContextRefresh = null
+
+function contextTokensOf(value) {
+  const n = num(value)
+  if (n <= 0) return 0
+  return Math.round(n < 10000 ? n * 1000 : n)
+}
+
+function parseModelContexts(models) {
+  const contexts = {}
+  for (const item of Array.isArray(models) ? models : []) {
+    const context = contextTokensOf(item?.maxContextWindow)
+    if (context <= 0) continue
+    if (item?.modelType) contexts[String(item.modelType)] = context
+    if (item?.modelId) contexts[String(item.modelId)] = context
+  }
+  return contexts
+}
+
+function readModelContextCache() {
+  try {
+    const d = dataDir()
+    if (!d) return null
+    const p = join(d, MODEL_CONTEXT_CACHE_FILE)
+    if (!existsSync(p)) return null
+    const cached = JSON.parse(readFileSync(p, "utf8"))
+    if (!cached?.at || !cached?.contexts) return null
+    return cached
+  } catch {
+    return null
+  }
+}
+
+function writeModelContextCache(contexts) {
+  const cached = { at: Date.now(), contexts }
+  try {
+    const d = dataDir()
+    if (d) writeFileSync(join(d, MODEL_CONTEXT_CACHE_FILE), JSON.stringify(cached), "utf8")
+  } catch {}
+  modelContextCache = cached
+  return contexts
+}
+
+async function loadModelContexts() {
+  if (modelContextCache && Date.now() - modelContextCache.at < MODEL_CONTEXT_CACHE_TTL_MS) return modelContextCache.contexts
+  const disk = readModelContextCache()
+  if (disk && Date.now() - disk.at < MODEL_CONTEXT_CACHE_TTL_MS) {
+    modelContextCache = disk
+    return disk.contexts
+  }
+  if (modelContextRefresh) return modelContextRefresh
+  modelContextRefresh = (async () => {
+    const auth = readMagpieAuth()
+    const license = auth?.license || auth?.accountId
+    if (!license) return disk?.contexts ?? {}
+    try {
+      const response = await fetch(`${BASE}/api/v2/api/models/available`, {
+        method: "POST",
+        headers: API_HEADERS(license),
+        body: JSON.stringify({
+          username: license,
+          type: "ZULU",
+          rootRepo: "",
+          submodules: [],
+          zuluVersion: "1.7.21",
+          source: "cli",
+          ideType: "zulucli",
+        }),
+        signal: AbortSignal.timeout(15000),
+      })
+      const result = await response.json()
+      if (!response.ok || result?.status !== "OK" || !Array.isArray(result?.data?.models)) {
+        return disk?.contexts ?? {}
+      }
+      const contexts = parseModelContexts(result.data.models)
+      return Object.keys(contexts).length ? writeModelContextCache(contexts) : disk?.contexts ?? {}
+    } catch {
+      return disk?.contexts ?? {}
+    } finally {
+      modelContextRefresh = null
+    }
+  })()
+  return modelContextRefresh
+}
+
+function modelEntry(m, baseURL, contexts = {}) {
   return [
     m.id,
     {
       id: m.id,
       name: m.label,
       provider: { npm: "@ai-sdk/openai-compatible", ...(baseURL ? { api: baseURL } : {}) },
-      limit: { context: 128000, output: 8192 },
+      limit: { context: contexts[m.id] ?? contexts[m.modelId] ?? m.context ?? 128000, output: 8192 },
       reasoning: true,
       tool_call: false,
       attachment: !!m.vision,
@@ -378,9 +469,9 @@ async function uploadImage(license, filePath) {
 
 // 一轮对话：建会话（或复用）→ 建任务 → execute；边收 SSE 边把增量交给 onDelta。
 async function callComate({ question, history, model, conversationId, images = [], onDelta, timeoutMs = 300000 }) {
-  const auth = readMagpieCookies()
-  if (!auth?.cookies?.length) throw new Error("没有百度 cookie：先 `magpie plugin login comate` 登录一次")
-  const license = await getLicense(buildCookieHeader(auth.cookies))
+  const auth = readMagpieAuth()
+  if (!auth?.license && !auth?.cookies?.length) throw new Error("文心快码未登录：先 `magpie plugin login comate` 登录一次")
+  const license = auth.license || await getLicense(buildCookieHeader(auth.cookies))
   const base = apiBase(license)
 
   // 图片：先上传拿 id，再在 contexts 里引用
@@ -845,14 +936,28 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
       cfg.provider ??= {}
       const was = cfg.provider[PROVIDER_ID] ?? {}
       const base = localBase || was.api
+      const contexts = await loadModelContexts()
+      const generated = Object.fromEntries(MODELS.map((m) => modelEntry(m, base, contexts)))
+      for (const m of MODELS) {
+        const existing = was.models?.[m.id]
+        if (!existing) continue
+        generated[m.id] = {
+          ...existing,
+          ...generated[m.id],
+          limit: { ...existing.limit, ...generated[m.id].limit },
+        }
+      }
+      const extraModels = Object.fromEntries(
+        Object.entries(was.models ?? {}).filter(([id]) => !generated[id]),
+      )
       cfg.provider[PROVIDER_ID] = {
         name: PROVIDER_NAME,
         npm: "@ai-sdk/openai-compatible",
         ...(base ? { api: base } : {}),
         ...was,
         models: {
-          ...Object.fromEntries(MODELS.map((m) => modelEntry(m, base))),
-          ...(was.models ?? {}),
+          ...extraModels,
+          ...generated,
         },
       }
     },
@@ -861,7 +966,8 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
       id: PROVIDER_ID,
       async models(provider) {
         const base = localBase || provider?.api
-        return Object.fromEntries(MODELS.map((m) => modelEntry(m, base)))
+        const contexts = await loadModelContexts()
+        return Object.fromEntries(MODELS.map((m) => modelEntry(m, base, contexts)))
       },
     },
 
@@ -873,7 +979,7 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
       // 跟着 magpie 里 DuMate 的登录态走：那边重登了，这边自动换新的。
       async refresh(auth) {
         if (auth?.type !== "oauth" || auth.source !== "magpie") return undefined
-        const d = readMagpieCookies()
+        const d = readMagpieAuth(["dumate"])
         if (!d) return undefined
         const oldHeader = buildCookieHeader(auth.cookies ?? [])
         const newHeader = buildCookieHeader(d.cookies)
@@ -893,11 +999,20 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
         } catch (e) {
           return { error: cardText(e?.message) || "登录态读取失败", signIn: "expired" }
         }
-        if (auth?.type !== "oauth" || !Array.isArray(auth.cookies) || !auth.cookies.length) {
+        if (auth?.type !== "oauth" || (!auth.license && !auth.cookies?.length)) {
           return { error: "没有登录信息，请先在 magpie 登录文心快码", signIn: "kept" }
         }
-        const header = buildCookieHeader(auth.cookies)
-        const cacheKey = header
+        if (auth.source === "device" && auth.license) {
+          return {
+            plan: "文心快码 Comate · 官网设备授权",
+            balance: "积分请到 Comate 官网查看",
+            windows: [],
+            user: auth.name || auth.accountId || PROVIDER_NAME,
+            signIn: "kept",
+          }
+        }
+        const header = buildCookieHeader(auth.cookies ?? [])
+        const cacheKey = auth.license || header
         let cached = usageCache.get(cacheKey)
         if (!cached) {
           const disk = readDiskCache()
@@ -910,7 +1025,8 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
         try {
           // 只打一个接口：Comate 对同一登录态的短时间连发很敏感，请求越少越稳，
           // 卡片上要的席位/增购/赠送/独立包都在 balance 里。
-          const bal = await getJson("/api/user/agent/balance", header)
+          const headers = auth.license ? { ...API_HEADERS(auth.license), token: auth.clientToken } : {}
+          const bal = await getJson("/api/user/agent/balance", header, { headers })
           if (!bal) throw new Error("Comate 积分接口不可用")
 
           const seat = packOf(bal.seatPoints)
@@ -964,21 +1080,27 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
       methods: [
         {
           type: "oauth",
+          label: "官网设备授权（自动登录，无需复制 Cookie）",
+          authorize: () => deviceLogin(),
+        },
+        {
+          type: "oauth",
           label: "复用 magpie 里已登录的百度账号（零操作）",
           authorize: async () => ({
             url: "",
             instructions:
-              "直接复用 magpie 里已登录的百度账号（文心快码与百度搭子共用同一个百度登录态）：只读本机 magpie 的凭据文件，不写任何东西。\n" +
-              "如果 magpie 里还没有登录过百度搭子，请改用下面的浏览器登录方式。",
+              "尝试复用 magpie 中保存的 Comate 或百度搭子登录凭据，只读本机凭据文件。百度搭子的登录凭据不保证能用于 Comate。\n" +
+              "如果复用被拒绝，请改用浏览器登录或手动粘贴 Comate 官网请求头中的 Cookie。",
             method: "auto",
             async callback() {
-              const d = readMagpieCookies()
+              const d = readMagpieAuth()
               if (!d) {
                 return {
                   type: "failed",
                   error: "没找到可复用的百度登录态（magpie 里没有已登录的 DuMate/Comate 账号）。请改用浏览器登录方式。",
                 }
               }
+              if (d.source === "device" && d.license) return { ...d, type: "success" }
               try {
                 const info = await verify(d.cookies)
                 return makeAuth(d.cookies, info, "magpie")
@@ -1054,4 +1176,6 @@ export const _internal = {
   missingCookies,
   packOf,
   parseCnTime,
+  contextTokensOf,
+  parseModelContexts,
 }
