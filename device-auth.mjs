@@ -57,6 +57,7 @@ export function deviceLogin({ fetchImpl = directFetch, sleep = wait, timeoutMs =
             if (!keyResponse.ok) throw new Error(`获取 License 返回 HTTP ${keyResponse.status}，请重试登录`)
             const key = await keyResponse.json()
             if (key?.status !== "OK" || !key.data?.key) throw new Error("网页授权已完成，但没有取得 License，请重试登录")
+            const accountName = key.data.displayName || key.data.key
             return {
               type: "success",
               access: key.data.key,
@@ -66,8 +67,8 @@ export function deviceLogin({ fetchImpl = directFetch, sleep = wait, timeoutMs =
               clientId,
               clientToken: result.data,
               source: "device",
-              accountId: key.data.key,
-              name: key.data.displayName || "文心快码 Comate",
+              accountId: accountName,
+              name: accountName,
             }
           }
           await sleep(pollMs, combined)

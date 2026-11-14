@@ -26,3 +26,17 @@ test("关闭的账号不会成为首选", () => {
   ]
   assert.equal(_internal.activeAuthHome(logins, "comate"), "comate#on")
 })
+
+test("登录身份优先使用 Comate 显示名", () => {
+  assert.equal(
+    _internal.authIdentity({
+      displayName: "account-name",
+      name: "other-name",
+      username: "username",
+      license: "license-id",
+    }),
+    "account-name",
+  )
+  assert.equal(_internal.authIdentity({ username: "username", license: "license-id" }), "username")
+  assert.equal(_internal.authIdentity({ license: "license-id" }), "license-id")
+})

@@ -15,6 +15,7 @@ test("网页授权后自动换取 License，所有请求都对应本次设备且
   assert.equal(result.license, "test-license")
   assert.equal(result.clientToken, "test-device-token")
   assert.equal(result.name, "test-user")
+  assert.equal(result.accountId, "test-user")
   assert.equal(requests.length, 3)
   assert.ok(requests.every(r => r.url.searchParams.get("clientId") === clientId))
   assert.ok(requests.every(r => !Object.keys(r.options.headers).some(k => k.toLowerCase() === "cookie")))

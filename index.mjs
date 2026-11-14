@@ -39,6 +39,10 @@ const REQUIRED_COOKIES = ["BDUSS"]
 
 const cardText = (value, max = 200) => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max)
 
+function authIdentity(info, fallback = PROVIDER_NAME) {
+  return cardText(info?.displayName || info?.name || info?.username || info?.license || fallback)
+}
+
 // magpie 的凭据库在 <data>/plugin-auth.json。插件可能是原地加载（plugin add <路径>），
 // 也可能是拷进 <data>/plugins/node_modules/<name>/，两种都要找得到：
 // 先看 magpie 自己报的数据目录 / 可执行文件位置，再看插件自身位置，最后看 cwd。
@@ -941,8 +945,9 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
     refresh: "",
     expires: 0,
     source,
-    accountId: String(info?.license ?? info?.username ?? PROVIDER_NAME),
-    name: String(info?.displayName ?? info?.username ?? ""),
+    license: String(info?.license || ""),
+    accountId: authIdentity(info),
+    name: authIdentity(info),
     cookies,
   })
 
@@ -956,7 +961,7 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
     // /api/user 偶尔被限流，balance 能通就说明这份登录态是活的。
     const bal = await getJson("/api/user/agent/balance", header)
     if (!bal) throw signInError("Cookie 未换到 Comate 账号信息")
-    return { username: "", license: "" }
+    throw new Error("Comate 登录已连通，但未取得账号名称；请稍后重试，避免生成重复账号")
   }
 
   return {
@@ -1214,4 +1219,5 @@ export const _internal = {
   parseModelContexts,
   activeAuthHome,
   authKeysFor,
+  authIdentity,
 }
