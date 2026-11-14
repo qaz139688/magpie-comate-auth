@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 const BASE = "https://comate.baidu.com"
+const directFetch = (input, init = {}) => fetch(input, { ...init, proxy: false })
 
 const wait = (ms, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason)
@@ -17,7 +18,7 @@ const wait = (ms, signal) => new Promise((resolve, reject) => {
 
 // 与百度官方 Zulu 1.7.21 的 SaaS 设备授权使用同一组接口。
 // 网页负责登录与设备确认，插件只接收该设备对应的授权结果。
-export function deviceLogin({ fetchImpl = fetch, sleep = wait, timeoutMs = 180000, pollMs = 2000 } = {}) {
+export function deviceLogin({ fetchImpl = directFetch, sleep = wait, timeoutMs = 180000, pollMs = 2000 } = {}) {
   const clientId = randomUUID()
   const url = new URL("/zh/login", BASE)
   url.searchParams.set("track", "COMATE_CLI")

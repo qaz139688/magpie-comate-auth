@@ -27,6 +27,7 @@ const PROVIDER_NAME = "文心快码 Comate"
 
 const BASE = "https://comate.baidu.com"
 const USER_CENTER = "https://comate.baidu.com/zh/user"
+const directFetch = (input, init = {}) => fetch(input, { ...init, proxy: false })
 const LOGIN_URL =
   "https://passport.baidu.com/v2/?login&tpl=mn&u=" + encodeURIComponent("https://comate.baidu.com/zh/user")
 
@@ -79,6 +80,21 @@ function pathOf(u) {
   return p
 }
 
+function activeAuthHome(logins, providerId) {
+  const rows = Array.isArray(logins) ? logins : []
+  const providerRows = rows.filter((row) => row?.agent === `plugin:${providerId}` && row?.on !== false)
+  return (
+    providerRows.find((row) => row?.first || row?.order === 1)?.home ||
+    providerRows[0]?.home ||
+    providerId
+  )
+}
+
+function authKeysFor(logins, providerId) {
+  const active = activeAuthHome(logins, providerId)
+  return [...new Set([active, providerId].filter(Boolean))]
+}
+
 // 读 magpie 里任意 provider 的 cookies（只读）。用于「复用已登录的百度账号」。
 function readMagpieAuth(providerIds = ["comate", "dumate"]) {
   for (const file of magpieAuthFiles()) {
@@ -89,13 +105,20 @@ function readMagpieAuth(providerIds = ["comate", "dumate"]) {
     } catch {
       continue
     }
+    let logins = []
+    try {
+      const loginsPath = join(dirname(file), "logins.json")
+      if (existsSync(loginsPath)) logins = JSON.parse(readFileSync(loginsPath, "utf8"))
+    } catch {}
     for (const id of providerIds) {
-      const entry = data?.[id]
-      if (entry?.source === "device" && entry.license) return entry
-      const cookies = Array.isArray(entry?.cookies) ? entry.cookies : null
-      if (!cookies?.length) continue
-      if (!cookies.some((c) => c?.name === "BDUSS")) continue
-      return { cookies, accountId: entry.accountId, name: entry.name }
+      for (const key of authKeysFor(logins, id)) {
+        const entry = data?.[key]
+        if (entry?.source === "device" && entry.license) return entry
+        const cookies = Array.isArray(entry?.cookies) ? entry.cookies : null
+        if (!cookies?.length) continue
+        if (!cookies.some((c) => c?.name === "BDUSS")) continue
+        return { ...entry, cookies }
+      }
     }
   }
   return null
@@ -145,7 +168,7 @@ function signInError(message) {
 }
 
 async function getJsonOnce(path, cookieHeader, timeoutMs, extraHeaders = {}) {
-  const res = await fetch(BASE + path, {
+  const res = await directFetch(BASE + path, {
     method: "GET",
     headers: {
       ...(cookieHeader ? { Cookie: cookieHeader } : {}),
@@ -345,10 +368,15 @@ async function loadModelContexts() {
   if (modelContextRefresh) return modelContextRefresh
   modelContextRefresh = (async () => {
     const auth = readMagpieAuth()
-    const license = auth?.license || auth?.accountId
+    let license = auth?.license || auth?.accountId
+    if (!license && auth?.cookies?.length) {
+      try {
+        license = await getLicense(buildCookieHeader(auth.cookies))
+      } catch {}
+    }
     if (!license) return disk?.contexts ?? {}
     try {
-      const response = await fetch(`${BASE}/api/v2/api/models/available`, {
+      const response = await directFetch(`${BASE}/api/v2/api/models/available`, {
         method: "POST",
         headers: API_HEADERS(license),
         body: JSON.stringify({
@@ -430,7 +458,7 @@ async function getLicense(cookieHeader) {
 }
 
 async function apiPost(license, path, body, { timeoutMs = 60000 } = {}) {
-  const r = await fetch(BASE + path, {
+  const r = await directFetch(BASE + path, {
     method: "POST",
     headers: { ...API_HEADERS(license), "X-Trace-Id": randomUUID() },
     body: JSON.stringify(body),
@@ -516,7 +544,7 @@ async function callComate({ question, history, model, conversationId, images = [
   if (!taskId) throw new Error("建任务失败：没拿到 taskId")
 
   const query = history ? `${history}\n\n用户：${question}` : question
-  const r = await fetch(BASE + "/api/aidevops/autocomate/rest/autowork/v2/execute", {
+  const r = await directFetch(BASE + "/api/aidevops/autocomate/rest/autowork/v2/execute", {
     method: "POST",
     headers: { ...API_HEADERS(license), Accept: "text/event-stream", "X-Trace-Id": randomUUID() },
     body: JSON.stringify({
@@ -1184,4 +1212,6 @@ export const _internal = {
   parseCnTime,
   contextTokensOf,
   parseModelContexts,
+  activeAuthHome,
+  authKeysFor,
 }
