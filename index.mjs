@@ -471,7 +471,7 @@ async function uploadImage(license, filePath) {
 async function callComate({ question, history, model, conversationId, images = [], onDelta, timeoutMs = 300000 }) {
   const auth = readMagpieAuth()
   if (!auth?.license && !auth?.cookies?.length) throw new Error("文心快码未登录：先 `magpie plugin login comate` 登录一次")
-  const license = auth.license || await getLicense(buildCookieHeader(auth.cookies))
+  const license = auth.license || auth.accountId || await getLicense(buildCookieHeader(auth.cookies))
   const base = apiBase(license)
 
   // 图片：先上传拿 id，再在 contexts 里引用
@@ -1072,7 +1072,13 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
           const expired = e?.signIn === "expired"
           // 被 Comate 临时拒了（短时间内请求过多会这样）：有旧数据就先给旧的，
           // 卡片不至于空着，下次刷新再拿新的。
-          if (cached) return { ...cached.data, error: cardText(e?.message) || "Comate 暂时拒绝请求，显示的是上次数据" }
+          if (cached) {
+            return {
+              ...cached.data,
+              plan: `${cached.data.plan || PROVIDER_NAME} · 额度为上次读取`,
+              asOf: new Date(cached.at).toISOString(),
+            }
+          }
           return { error: cardText(e?.message) || "Comate 用量查询失败", signIn: expired ? "expired" : "kept" }
         }
       },
