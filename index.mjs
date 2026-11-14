@@ -1099,7 +1099,7 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
               "如果复用被拒绝，请改用浏览器登录或手动粘贴 Comate 官网请求头中的 Cookie。",
             method: "auto",
             async callback() {
-              const d = readMagpieAuth()
+              const d = readMagpieAuth(["dumate", "comate"])
               if (!d) {
                 return {
                   type: "failed",
